@@ -186,7 +186,7 @@ KL_file_suffix=1.2,0.8 python generate_outputs.py --model_parm_both_name_or_path
 Note how the objective weights are doubled to get the alpha values; this increases the strength of the guidance. The `--normalize_logit` argument causes the sampling temperature to be 1.0, matching the default for MAVIS.
 
 ## Acknowledgements
-The code we use for fine-tuning the generative model is heavily based on the official code for Rewards-in-Context [1].
+The code we use for fine-tuning the generative model is heavily based on the official code for Rewards-in-Context [1]. We would also like to thank the developers of HuggingFace's [Transformers](https://github.com/huggingface/transformers) and [TRL](https://github.com/huggingface/trl) packages since we used them extensively. Lastly, we note that portions of this research were conducted with the advanced computing resources provided by Texas A&M High Performance Research Computing.
 
 [1] Yang, R.; Pan, X.; Luo, F.; Qiu, S.; Zhong, H.; Yu, D.; and Chen, J. 2024. Rewards-in-Context: Multi-objective Alignment of Foundation Models with Dynamic Preference Adjustment. arXiv:2402.10207.
 
