@@ -1,0 +1,17 @@
+*.pkl
+*.hdf5
+*.txt
+!requirements.txt
+*.csv
+*.job
+*.yaml
+*.json
+*.jsonl
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.png
+
+*/__pycache__/*
+*/wandb/*

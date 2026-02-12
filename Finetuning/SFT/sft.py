@@ -19,11 +19,6 @@ hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
 summary_dataset_path = 'openai/summarize_from_feedback'
 
 import wandb
-wandb.init(
-    project="sft",
-    name="summary_sft_all_bs1_lora64",
-)
-
 
 @dataclass
 class ScriptArguments:
@@ -36,6 +31,8 @@ class ScriptArguments:
     wandb_name: Optional[str] = field(default='summary_sft_all_bs1_lora64', metadata={"help": "Name for this experiment"})
     exp_type: Optional[str] = field(default='summary', metadata={"help": "exp type, 'summary' or 'assistant' "})
     base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
+    max_steps: Optional[int] = field(default=20000, metadata={"help": "max steps to train"})
+    dataset_size: Optional[int] = field(default=5000, metadata={"help": "Number of samples from the dataset to use"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
@@ -46,11 +43,11 @@ print('base model: ', base_model_name)
 os.makedirs(os.path.join(script_args.save_directory, script_args.wandb_name), exist_ok=True)
 
 training_args = TrainingArguments(
-        max_steps=20000,  
+        max_steps=script_args.max_steps,
         output_dir=os.path.join(script_args.save_directory, script_args.wandb_name),
         dataloader_drop_last=True,
         eval_steps=30000,
-        save_steps=10000,
+        save_steps=500,
         logging_steps=10,
         save_strategy='steps',
         per_device_train_batch_size=script_args.batch_size,
@@ -70,6 +67,11 @@ process_id = Accelerator().local_process_index
 gpu_id = process_id 
 print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 
+if process_id == 0:
+    wandb.init(
+        project="sft",
+        name=script_args.wandb_name,
+    )
 
 # set seed before initializing value head for deterministic eval
 set_seed(8888)
@@ -100,11 +102,12 @@ else:
 model.resize_token_embeddings(len(tokenizer))
 
 if exp_type == 'assistant':
-    dataset = build_dataset(hhrlhf_dataset_path, tokenizer, split='train',size=5000) 
+    dataset = build_dataset(hhrlhf_dataset_path, tokenizer, split='train',size=script_args.dataset_size) 
     response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]  
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
 else:
-    dataset = build_dataset_summary(summary_dataset_path, tokenizer, split='train',size=5000)
+    assert script_args.dataset_size <= 6000, "For summary dataset, the maximum number of training samples is 6000 due to limited size of the dataset"
+    dataset = build_dataset_summary(summary_dataset_path, tokenizer, split='train',size=script_args.dataset_size)
     response_template_ids = tokenizer.encode(Instructions_summary.response_split, add_special_tokens=False)[1:]  
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
 train_dataset = dataset.shuffle()

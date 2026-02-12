@@ -2,6 +2,7 @@
 *.hdf5
 *.txt
 !requirements.txt
+!utils/vllm_requirements.txt
 *.csv
 *.job
 *.yaml
@@ -19,9 +20,7 @@ unused/*
 wandb/*
 job_scripts/*
 
-morlhf/*
-reward_soup/*
-sft_model/*
-value_models/*
-Anthropic/*
-Summary/*
+Training_Output/*
+Eval_Logs/*
+Models/*
+scripts/anthropic/extra/*

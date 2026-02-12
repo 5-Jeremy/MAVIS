@@ -1,131 +1,195 @@
-# Environment Setup
-The environment we used when running our experiments can be recreated using the included requirements.txt file. The required Python version is 3.10.18.
+# MAVIS: Multi-Objective Alignment via Inference-Time Value-Guided Selection
 
-# GPU Requirements
-We recommend using NVIDIA A100 80GB GPUs or other GPUs with a similar amount of memory for these experiments. This is more of a requirement when training if you intend to use the same batch size which we used, but for inference GPUs with less memory will likely suffice.
+## Environment Setup
+Due to compatibility issues, different versions of certain packages are needed for running different scripts within this codebase. Each subdirectory has its own requirements.txt file which can be used to setup a suitable Python environment. In both cases, the recommended Python version is 3.10.18. When installing from the requirements.txt file, include the argument --extra-index-url=https://download.pytorch.org/whl/cu121 to ensure that the pytorch package compiled with CUDA can be found. In addition to installing the packages from the requirements files, you will also need to install the safe_rlhf package from the submodule by running "pip install -e ." inside the safe-rlhf directory. Additionally, to run the LLM-as-a-Judge evaluation, a separate environment is needed. The requirements.txt file for this environment can be found in the utils directory.
 
-# Dataset Preprocessing
-To create a CSV file with the preprocessed data for a specific split of one of the datasets, run 
+## GPU Requirements
+We recommend using GPUs with at least 80GB of memory for these experiments. This is more of a requirement when training if you intend to use the same batch size which we used, but for inference GPUs with less memory will suffice. When fine-tuning a Llama-2 13B model, utilizing multiple GPUs is recommended.
+
+## Dataset Preprocessing
+To create a CSV file with the preprocessed data for a specific split of one of the datasets, go to the MAVIS directory and run 
 ```bash
-python dataset_preprocess.py <anthropic|summary> --split=<split>
+python dataset_preprocess.py <anthropic|summary|safeRLHF> <train|test>
 ```
-where the first argument indicates the dataset and `<split>` is either `train` or `test`.
+where the first argument indicates the dataset and the second indicates the split. NOTE: unlike the other data which we retrieve directly from the HuggingFace hub, the test split for the safeRLHF dataset should be preprocessed using the official code for PARM [2] to ensure identical evaluation conditions for MAVIS and PARM. This can be done by cloning the [PARM codebase][https://github.com/Baijiong-Lin/PARM] and following the directions under the "Preparing Data" section of their README. This will produce a file named "test_prompt_only.json" which should be placed inside the Mavis/datasets/safeRLHF directory before running dataset_preprocess.py.
 
-# Creating the reference model with SFT
-In the Finetuning/SFT directory, run the following:
+## Creating the reference model with SFT
+The script sft.py in the Finetuning/SFT directory is used to train the reference model, starting from a pretrained model (either Llama 2 7B or Llama 2 13B). Note that the SFT step is not required for the base model used with the safeRLHF dataset.
+
+To run on a single GPU:
    ```bash
-   python sft.py --save_directory <DIR> --wandb_name <NAME> --exp_type <assistant|summary>
+   python sft.py --base_model_name <MODEL_NAME> --save_directory <DIR> --wandb_name <NAME> --exp_type <assistant|summary> --batch_size <BS> --max_steps <STEPS> --dataset_size <SIZE>
    ```
+   - `<MODEL_NAME>`: Name or local path for the model to train
    - `<DIR>`: Path to save the LoRA adapter (e.g., `checkpoints/sft_lora`).
    - `<NAME>`: Run name for logging to Weights & Biases (e.g., `sft_run_1`).
    - `<assistant|summary>`: Type of experiment (e.g., `assistant` for Anthropic HH-RLHF or `summary` for OpenAI Summarize from Feedback).
+   - `<BS>`: The training batch size; the default value is 1 which matches what we used for all models.
+   - `<STEPS>`: The number of training steps; the default value matches what we used for all models (however, we did not always use the last checkpoint; see Appendix F for details).
+   - `<SIZE>`: The number of samples to take from the dataset; the default value matches what we used for all models.
 
+To run on multiple GPUs (four in this example):
    ```bash
-   python merge_sft_lora.py --lora_name <DIR/NAME>
+   CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch sft.py --base_model_name <MODEL_NAME> --save_directory <DIR> --wandb_name <NAME> --exp_type <assistant|summary> --batch_size <BS> --max_steps <STEPS> --dataset_size <SIZE>
    ```
-   - `<DIR/NAME>`: Full path combining the save directory and run name (e.g., `checkpoints/sft_lora/sft_run_1`).
-The merged SFT model should be copied to MAVIS/sft_model/{dataset}
 
-# Training Value Models
-We have included scripts with the commands needed to collect training data and train each value model. Note that running these scripts will perform all data collection sequentially on one GPU, which will take much more time than running it in parallel. Thus, when multiple GPUs are available we recommend manually running the commands and using the --device argument to specify different GPUs for the data collection processes so that they can run at the same time. You may have to divide up the prompt ranges manually (e.g. "get_data_base.py 0 5000" would become "get_data_base.py 0 2500 --output_dir={dir1}" and "get_data_base.py 2500 2500 --output_dir={dir2}" - note how unique output directories must be specified to avoid two processes writing to the same HDF5 file concurrently). This will result in different sequences being generated compared to generating them all with one command, but the final training outcome should not be too different. Since each process running a data collection script will create a separate HDF5 file, it is necessary to combine them into a single file for use during training. This can be done using a function in utils/hdf5_utils.py as follows:
+The SFT process will produce a LoRa adapter for the model. This adapter must be merged with the base model weights to obtain the full reference model.
+   ```bash
+   python merge_sft_lora.py --lora_name <DIR/NAME> --base_model_name <MODEL_NAME>
+   ```
+   - `<DIR/NAME>`: Path to the adapter generated by sft.py.
+   - `<MODEL_NAME>`: Should match the argument used when running sft.py
+
+The merged SFT model should be copied to MAVIS/sft_model/<BASE_NAME>/{dataset} where <BASE_NAME> is either llama_7b or llama_13b.
+
+## Switching Datasets and Models
+Most of the scripts in the Mavis directory have the argument --dataset which is used to specify which dataset should be assumed, and any script involving generation will have the argument --base_model_type which is used to specify what SFT model to use as the reference/base generative model. The arguments used for generation have default values assigned at the bottom of gen_utils.py, so instead of including these arguments with every script you can simply set them there (note however that scripts like train_value_model.py which do not involve generation but still have a --dataset argument will not inherit that default).
+
+## Training Value Models
+Before beginning the process of training value models, make sure you have preprocessed the data and run SFT to get the reference model (if needed) as explained in the above steps. 
+
+Multiple python scripts must be run in sequence to collect training data and train each value model. These are `get_data_base.py`, `label_tree.py`, `train_value_model.py`, and `get_data_iter.py`. The scripts assume that you are using llama_7b as your base model, but this can be changed by adding "--base_model_type=llama_13b" or "--base_model_type=alpaca" as an argument to any python script which accepts it (make sure the base model is suitable for the dataset). `get_data_base.py` is used for collecting data from the reference model to train the first iteration of value models (which we call iteration 0), `label_tree.py` prepares the collected data for use in training, `train_value_model.py` handles the training of value models, and `get_data_iter.py` is used to collect data from an existing MAVIS policy for a single objective to train further iterations. 
+
+If collecting each tree of data sequentially is acceptable, then you can simply use scripts/get_data.sh instead of manually calling `get_data_base.py`, `label_tree.py`, or `get_data_iter.py`. However, collecting the data for all prompts sequentially on a single process is inefficient, and we recommend collecting data across multiple parallel processes where each process uses a separate GPU if multiple are available. Some examples of how to do this are given in the scripts directory. If you only have one GPU, you may still be able to run multiple processes in parallel by partitioning the GPU using NVIDIA MIG [3]. You can use the CUDA_VISIBLE_DEVICES environment variable to specify different GPUs for each processes so that they can run simultaneously. You may have to divide up the prompt ranges manually (e.g. "get_data_base.py 0 5000" would become "get_data_base.py 0 2500 --output_dir={dir1}" and "get_data_base.py 2500 2500 --output_dir={dir2}" - note how unique output directories must be specified to avoid two processes writing to the same HDF5 file concurrently). Due to the initial random state being different, this will result in different sequences being generated for some of the prompts compared to generating them all with one command, but the final training outcome should not be too different. Since each process running a data collection script will create a separate HDF5 file, it is necessary to combine them into a single file for use during training. This can be done using a function in utils/hdf5_utils.py as follows:
 ```bash
 python
 >>> from utils.hdf5_utils import *
->>> merge_hdf5_files([<data_dir_1>/all_tokens.hdf5, ..., <data_dir_N>/all_tokens.hdf5], <output_dir>/all_tokens.hdf5)
+>>> merge_hdf5_files([<data_dir_1>/all_data.hdf5, ..., <data_dir_N>/all_data.hdf5], <output_dir>/all_data.hdf5)
 ```
-This will create a file called all_tokens.hdf5 inside output_dir which will contain the contents of all of the HDF5 files included in the list passed as the first argument to the function.
+This will create a file called all_data.hdf5 inside output_dir which will contain the contents of all of the HDF5 files included in the list passed as the first argument to the function.
 
-Before training the iteration 0 value models, make sure you have preprocessed the data and run SFT to get the reference model as explained in the above steps. To train the iteration 0 value models for all objectives under a given dataset, simply run scripts/{dataset}/train_iter_0.sh (Or if you want to parallelize data collection, run the commands manually). Afterwards, to train future iterations you can use the get_data.sh script to generate and label the data, then create the training/validation splits from the labeled data (following lines 18-23 in train_iter_0.sh) and run the training script as follows:
+To change the size of the trees generated (e.g. increase the branching factor or depth), you can use the arguments `--root_children`, `--non_root_children`, and `--num_layers`. The roles of these arguments are given in the help text (e.g. `python get_data_base.py --help`).
+
+The value model training script is run as follows:
 ```bash
-python train_value_model.py --dataset <anthropic|summary> --objective <OBJECTIVE> --data_dir <DATA_DIR> --init_checkpoint <INIT_DIR> --output_dir <OUTPUT_DIR> --num_epochs=_ --batch_size=_ --lr=_ --weight_decay=_ --KL_penalty <ETA> --no_warmup
+python train_value_model.py --dataset <anthropic|summary|safeRLHF> --objective <OBJECTIVE> --data_file <DATA_FILE> --init_checkpoint <INIT_DIR> --output_dir <OUTPUT_DIR> --num_epochs=_ --fraction_bottom_nodes_to_keep <FRAC_BOTTOM_NODES> --num_val_trees <NUM_VAL> --KL_penalty <ZETA> --no_warmup ...
 ```
-- `<OBJECTIVE>`: The abbreviated name for the objective (help for helpfulness, harm for harmlessness, faithful for faithfulness; no abbreviation is used for humor or summarization)
-- `<DATA_DIR>`: The directory containing the data from training; should contain an all_tokens.hdf5 file, a train subdirectory, and a val subdirectory
-- `<INIT_DIR>`: The directory containing the adapter_config.json and adapter_model.safetensors files for the value model you want to initialize from
+- `<OBJECTIVE>`: The abbreviated name for the objective (help for helpfulness, harm for harmlessness, faithful for faithfulness; no abbreviation is used for humor or summarization. For safeRLHF, use safeRLHF_help and safeRLHF_harm)
+- `<DATA_FILE>`: The file containing the data to train on (generated by running label_tree.py on the file created with get_data_base.py or get_data_iter.py)
+- `<INIT_DIR>`: The directory containing the adapter_config.json and adapter_model.safetensors files for the value model you want to initialize from (only used during iterative training)
 - `<OUTPUT_DIR>`: The directory where the training checkpoints, training logs, and final model will be saved
-- `<ETA>`: The weight applied to the KL penalty term for the soft value function (see equations 1 and 2 in the main paper)
+- `<FRAC_BOTTOM_NODES>`: What fraction of bottom-level nodes in the data trees to actually use as training data; the rest will be discarded. The purpose of this is to avoid a major imbalance toward nodes at the bottom of the tree that represent complete sequences (see Appendix F in the MAVIS paper for further discussion)
+- `<NUM_VAL>`: How many of the trees in the data file should be used for validation data. If no number is specified, 10% of the trees will be used. We recommend using at least 100 trees for validation.
+- `<ZETA>`: The weight applied to the KL penalty term for the soft value function (see equations 1 and 2 in the main paper; only used during iterative training)
 
-# Setting up for MAVIS Evaluation
-If you have a trained value model for each objective and you wish to evaluate their performance, you must take the files adapter_config.json and adapter_model.safetensors created during training and place them in the directory value_models/iter_#/{objective}/ where the iteration number can be chosen to reflect how many times the value model has undergone training, and {objective} is the abbreviated name of the objective for that value model (see above).
+Note that there are other arguments you can use to set hyperparameters and customize training, but in most cases the defaults will work fine.
 
-# Running MAVIS Evaluation
-The basic command to evaluate the performance of MAVIS is to run 
+When training iteration 1 and beyond, the differences in how train_value_model.py is run are that you pass the path to your existing value model to `--init_checkpoint` and you can add a KL penalty using `--KL_penalty`. We also recommend applying `--no_warmup` when initializing from an existing value model, since the purpose of the warmup is to avoid drastic weight updates early on when initializing from a model that was pretrained for next-token prediction.
+
+## Running MAVIS Evaluation
+If you have a trained value model for each objective and you wish to evaluate their performance, you must first take the files adapter_config.json and adapter_model.safetensors created during training and place them in the directory value_models/iter_#/{objective}/ where the iteration number starts at 0 and reflects how many times the value model has undergone iterative training, and {objective} is the abbreviated name of the objective for that value model (see above). Then, you can execute mavis.py in the following way:
 ```bash
-python mavis.py --dataset <anthropic|summary> --obj_weights <WEIGHTS> --value_model_dir <VM_DIR> --value_model_iter <VM_ITER> --beta <BETA> [--track_KL]
+python mavis.py --dataset <anthropic|summary|safeRLHF> --obj_weights <WEIGHTS> --value_model_iter <VM_ITER> --beta <BETA> [--track_KL]
 ```
 - `<WEIGHTS>`: A comma-separated list of floating-point values that sum to one. If the weight of an objective is set to 0.0, no value model will be loaded for that objective but rewards for that objective will still be tracked. If you do not want to track rewards for an objective, leave its spot in the list empty (e.g. 0.2,,0.8). The order of objectives is [helpfulness,harmlessness,humor] for the anthropic dataset and [summarization,faithfulness] for the summary dataset.
-- `<VM_DIR>`: The path to a directory containing value models for the objectives which will need them. The structure of the directory should be as specified in "Setting up for MAVIS Evaluation".
 - `<VM_ITER>`: A comma-separated list of non-negative integers for the objectives which need value models. This is used to determine which subdirectory within `<VM_DIR>` each value model should be loaded from. For objectives which do not need a value model, leave their position empty (e.g. 1,,0).
 - `<BETA>`: Parameter which scales the normalized values, and hence determines how much they can alter the token distribution
 - `track_KL`: If this flag is used, the KL divergence between the MAVIS policy and the reference policy (computed according to equation 6 in the main paper) will be recorded in the final statistics
 
-Note that we have included scripts which will evaluate the entire pareto front by repeatedly calling this command, but these scripts assume that a single value of beta will be used across the entire pareto front; for more flexibility, run the commands manually
+If you save your value model to a directory other than "value_models", you will also need to include the --value_model_dir argument and pass in the path to that directory. The value models must be broken up by iteration and objective as specified above.
 
-# PPO/MORLHF Training for Baselines
+Note that we have included scripts which will evaluate the entire pareto front by repeatedly calling this command. These scripts will use the same settings, including value model iteration and beta, which were use used in the results shown in our paper.
+
+## Distilling Value Models
+If you have followed the above steps to train a value model for each objective, you can perform distillation to obtain a combined value model using distill_value_models.py. You should use the value_model_dir and value_model_iter arguments to specify where the script should load the teacher models from. To evaluate the distilled model, run mavis_distill.py and provide the path to the distilled model weights for the value_model_dir argument (There is no need to specify an iteration number). Besides how the value model is loaded, this script uses the same arguments as mavis.py.
+
+## PPO/MORLHF Training for Baselines
 We use modified scripts from the official code for Rewards-In-Context [1] for training PPO models. Assuming you have created and merged the SFT model for the desired dataset, you can run PPO fine-tuning using the ppo.py script in Finetuning/PPO as follows:
 
 ```bash
-python ppo.py --base_model <SFT_MODEL_PATH> --exp_type <assistant|summary> --alpha <ALPHA>
+python ppo.py --sft_model_path <SFT_MODEL_PATH> --exp_type <assistant|summary> --reward_models <OBJ_1> ... --reward_weights <LAMBDA_1> ...
 ```
 - `<SFT_MODEL_PATH>`: Path to the merged sft model for the desired dataset.
 - `<assistant|summary>`: Type of experiment (e.g., `assistant` for Anthropic HH-RLHF or `summary` for OpenAI Summarize from Feedback).
-- `<ALPHA>`: This is equivalent to lambda_1 in our formulation.
+- `<OBJ_1>`: The name of the objective whose reward model should be optimized ("helpful", "harmless", or "humor" for the anthropic HH-RLHF dataset, and "summary" or "faithful" for the summarize from human feedback dataset). Provide multiple names to do MORLHF.
+- `<LAMBDA_1>`: The weight to put on the first objective in the list provided for `--reward_models`. Additional values should be provided for each additional name given to `--reward_models`. The values should sum to 1. If only one objective was specified, this argument can be omitted.
+- The other arguments you may need to set are the target KL divergence (`--target`), the initial KL penalty coefficient (`--init_kl_coef`), the lora rank (`--lora_rank`), the mini batch size (`--mini_batch_size`), and the top-k sampling parameter (`--top_k`). The values which we used in our training runs can be found in Appendix F of our paper.
 
-# Setting up for Baseline Evaluation
-Models trained using PPO should be organized into the following directory trees (all within the MAVIS directory):
+## Parameter Merging for Reward Soup
+Currently, our code only supports merging the full state-dictionaries of models, which means that you must create a full model which incorporates each set of LoRa weights and merge the parameters of those models together. This can be done using reward_soup_merge.py in the Finetuning directory. Once you have created a merged model, it must be moved to the appropriate location in Mavis/reward_soup/ before attempting to evaluate it (see below)
+
+## MOODPO Training
+See the MOODPO directory of the supplementary materials for instructions on how to train for Multi-Objective Online DPO.
+
+## Setting up for Baseline Evaluation
+Models for the fine-tuning baselines should be organized into the following directory trees (all within the MAVIS/Models directory) where each "leaf" directory contains a set of model weights (for reward soup these need to be full model weights obtained via merging the LoRa adapter with the SFT model; for the rest they should just be the LoRa weights):
 
 - morlhf
-   - anthropic
-      - harm_humor
-         - morlhf_0.2
-         - morlhf_0.4
-         - morlhf_0.6
-         - morlhf_0.8
-      - help_harm
+   - llama_7b
+      - anthropic
+         - harm_humor
+            - morlhf_0.2
+            - morlhf_0.4
+            - morlhf_0.6
+            - morlhf_0.8
+         - help_harm
+            - morlhf_0.2
+            - &#x22EE;
+         - help_humor
+            - morlhf_0.2
+            - &#x22EE;
+         - single
+            - help
+            - harm
+            - humor
+      - summary
          - morlhf_0.2
          - &#x22EE;
-      - help_humor
-         - morlhf_0.2
-         - &#x22EE;
-      - single
-         - help
-         - harm
-         - humor
-   - summary
-      - morlhf_0.2
+         - single
+            - summarization
+            - faithful
+   - llama_13b
       - &#x22EE;
-      - single
-         - summarization
-         - faithful
 - reward_soup
-   - anthropic
-      - harm_humor
+   - llama_7b
+      - anthropic
+         - harm_humor
+            - reward_soup_0.2
+            - reward_soup_0.4
+            - reward_soup_0.6
+            - reward_soup_0.8
+         - help_harm
+            - reward_soup_0.2
+            - &#x22EE;
+         - help_humor
+            - reward_soup_0.2
+            - &#x22EE;
+      - summary
          - reward_soup_0.2
          - reward_soup_0.4
          - reward_soup_0.6
          - reward_soup_0.8
-      - help_harm
-         - reward_soup_0.2
-         - &#x22EE;
-      - help_humor
-         - reward_soup_0.2
-         - &#x22EE;
-   - summary
-      - reward_soup_0.2
-      - reward_soup_0.4
-      - reward_soup_0.6
-      - reward_soup_0.8
+   - llama_13b
+      - &#x22EE;
+- moodpo
+   - llama_7b
+      - anthropic
+      - summary
+   - llama_13b
+      - &#x22EE;
 
-# Running Baseline Evaluation
-There are three scripts used for evaluating the baselines. The first two, baseline_eval.py and baseline_eval_KL.py, are used to run MORLHF and Rewarded Soups. The third, mod_eval.py, is used to run MOD. Note that baseline_eval.py and mod_eval.py only evaluate the rewards (not the KL divergence) while baseline_eval_KL.py also evaluates the KL divergence by running a forward pass on the generated sequence through the reference model. All of these scripts use the same obj_weights argument to control the weight assigned to each objective. For MORLHF and Rewarded Soups, a different model is loaded depending on the objective weights. For MOD, the single-objective PPO model for each of the relevant objectives are all loaded. When running baseline_eval.py or baseline_eval_KL.py, the arguments --ppo and --morlhf determine which model to load when multiple objectives have weight assigned to them (if only one objective has weight, they have the same effect). The --ppo argument corresponds to Rewarded Soups, and the --morlhf argument corresponds to MORLHF. If neither argument is used, then the reference model will be loaded instead.
+## Running Baseline Evaluation
+There are two scripts used for evaluating the baselines. The first, baseline_eval_KL.py, is used to run MORLHF, Rewarded Soups, and MOODPO. The second, mod_eval.py, is used to run MOD. Note that baseline_eval_KL.py only evaluates the KL divergence if the --track_KL flag is included since it can interfere with measuring the decoding speed. Since we do not measure the decoding speed for MOD, mod_eval.py will automatically perform KL divergence measurements. Note that in our MOD implementation the individual fine-tuned models are run sequentially, so the decoding speed will be very slow.
 
-# Evaluation Logs
+The scripts baseline_eval_KL.py and mod_eval.py use the same obj_weights argument to control the weight assigned to each objective. For MORLHF and Rewarded Soups, a different model is loaded depending on the objective weights. For MOD, the single-objective PPO model for each of the relevant objectives are all loaded. When running baseline_eval_KL.py, the --moodpo argument forces the MOODPO model corresponding to the desired dataset and base model type to be loaded. Otherwise, the arguments --ppo and --morlhf determine which model to load when multiple objectives have weight assigned to them (if only one objective has weight, they have the same effect). The --ppo argument corresponds to Rewarded Soups, and the --morlhf argument corresponds to MORLHF. If none of the aforementioned arguments are used, then the reference model will be loaded instead.
+
+## Evaluation Logs
 Whenever an evaluation script is run, it creates a new subdirectory in one of four main directories (either baseline_logs, baseline_bon_logs, mavis_logs, or mavis_bs_logs) depending on which script was run. Inside the subdirectory, you will find a YAML file listing the arguments that the script was run with, a CSV file with the average rewards and average generation time for each prompt, and (if the evaluation runs to completion) a text file with the overall statistics.
 
-# Test-Time Search
-The baseline methods can be run with best-of-N simply by adding `--num_samples=N` when running the evaluation script. To run MAVIS with beam search, you must use mavis_bs.py which accepts a similar set of arguments as mavis.py except it does not accept `--track_KL` and it has the additional arguments `Q`, `N`, and `num_samples`. `Q` determines the number of parallel sequences, `N` determines the number of final candidates which are returned to be ranked by the reward models (set to `Q` by default), and `num_samples` is a hyperparameter which determines how many candidates from each beam are compared with each other when deciding on the next set of beams (we did not observe improved performance from changing this parameter from its default value).
+## Comparing with PARM
+To compare MAVIS with Multi-Objective Test-Time Alignment via Preference-Aware Autoregressive Reward Model (PARM) [2], we train MAVIS for the PKU safeRLHF dataset to match what is available in the public code for PARM. This is done in the same way as with the Anthropic HH-RLHF or OpenAI Summarize from Feedback datasets, except the base model is different ('alpaca' instead of 'llama_7b/13b') and the maximum completion length is increased to 512. Note that the objectives are named ```safeRLHF_help``` and ```safeRLHF_harm``` to avoid confusion with the existing helpfulness and harmlessness objectives. We evaluate MAVIS on 100 of the test prompts which the authors of PARM used for their evaluation (see below for instructions) and compare that with results obtained from training PARM using thier codebase. To ensure a fair comparison, we tracked the KL divergence of PARM from the base Alpaca model using Eq. 7 from the MAVIS paper (this involved modifying the model_arithmetic.py file from their codebase; see below). Additionally, we doubled the alpha values provided when running generate_outputs.py to increase the influence which the value model in PARM has such that its KL divergence is similar to or greater than that of MAVIS. We also enforce a temperature of 1.0 via the --normalize_logit argument to match the temperature used by MAVIS.
 
-# Acknowledgements
-The code we use for fine-tuning the generative model is heavily based on the official code for Rewards-in-Context.
+To reproduce our evaluation of PARM, you must replace the files "generate_outputs.py" and "model_arithmetic.py" from the PARM codebase with the modified version we provide in the Parm_patches directory. Our modifications to generate_outputs.py add the --first_100_only argument which restricts evaluation to the first 100 test prompts. Our modifications to model_arithmetic.py cause the log probability ratio sums for each sequence generated during evaluation to be written to a file such that the approximate KL divergence can be computed according to Eq. 7 in the MAVIS paper. The name of the file is determined by the environment variable `KL_file_suffix`. Once the files have been replaced, you can follow the given directions to train the PARM model. The command to run evaluation will look something like the following (using the objective weights of 0.6,0.4 as an example):
+```bash
+KL_file_suffix=1.2,0.8 python generate_outputs.py --model_parm_both_name_or_path <path_to_checkpoint> --alpha_helpfulness 1.2 --alpha_harmlessness 0.8 --normalize_logit True --first_100_only True
+```
+Note how the objective weights are doubled to get the alpha values; this increases the strength of the guidance. The `--normalize_logit` argument causes the sampling temperature to be 1.0, matching the default for MAVIS.
+
+## Acknowledgements
+The code we use for fine-tuning the generative model is heavily based on the official code for Rewards-in-Context [1].
 
 [1] Yang, R.; Pan, X.; Luo, F.; Qiu, S.; Zhong, H.; Yu, D.; and Chen, J. 2024. Rewards-in-Context: Multi-objective Alignment of Foundation Models with Dynamic Preference Adjustment. arXiv:2402.10207.
+
+[2] Baijiong Lin, Weisen Jiang, Yuancheng Xu, Hao Chen, and Ying-Cong Chen. PARM: Multi-objective test-time alignment via preference-aware autoregressive reward model. In Proceedings of the Forty-Second International Conference on Machine Learning, 2025
+
+[3] https://docs.nvidia.com/datacenter/tesla/mig-user-guide/introduction.html

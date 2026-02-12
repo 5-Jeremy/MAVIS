@@ -13,8 +13,12 @@ from utils import print_trainable_parameters, load_main_tokenizer, Instructions,
 from multi_reward_models import RewardModels
 tqdm.pandas()
 from peft import LoraConfig
+from time import time
+import wandb
 
-import matplotlib.pyplot as plt
+start = time()
+
+# import matplotlib.pyplot as plt # Not using
 # define paths for two datasets
 hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
 summary_dataset_path = 'openai/summarize_from_feedback'
@@ -38,7 +42,7 @@ class ScriptArguments:
         default_factory=lambda: ['helpful'],
         metadata={"help": "List of reward models to use (e.g., summary, faithful, helpful, harmless, etc.)"}
     )
-
+    sft_model_path: Optional[str] = field(default=None, metadata={"help": "Path to the SFT model (after merging LoRA weights)"})
     # Add weights for reward models
     reward_weights: Optional[List[float]] = field(
         default_factory=lambda: [1.0],
@@ -46,13 +50,17 @@ class ScriptArguments:
     )
     wandb_name: Optional[str] = field(default='ppo_summarization', metadata={"help": "Name for this experiment"})
     exp_type: Optional[str] = field(default='summary', metadata={"help": "exp type: 'assistant" or 'summary'}) 
-    dataset: Optional[str] = field(default='summary', metadata={"help": "dataset type: 'anthropic' or 'summary'"})
+    lora_rank: Optional[int] = field(default=64, metadata={"help": "lora rank"})
+    top_k: Optional[int] = field(default=15, metadata={"help": "top-k parameter for sampling"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 exp_type = script_args.exp_type
-# Remember to use a merged sft model if using lora
-base_model_name = os.path.join('../sft_model', script_args.dataset)
+dataset = 'anthropic' if exp_type == 'assistant' else 'summary'
+if script_args.sft_model_path is not None:
+    base_model_name = script_args.sft_model_path
+else:
+    base_model_name = os.path.join('../sft_model', dataset)
 tokenizer_name = base_model_name
 print('base model: ', base_model_name)
 
@@ -65,18 +73,18 @@ DATASET_REWARD_MAPPING = {
 }
 
 # Validate that reward models match the selected dataset
-if script_args.dataset in DATASET_REWARD_MAPPING:
-    valid_rewards = DATASET_REWARD_MAPPING[script_args.dataset]
+if dataset in DATASET_REWARD_MAPPING:
+    valid_rewards = DATASET_REWARD_MAPPING[dataset]
     for reward in script_args.reward_models:
         if reward.lower() not in [r.lower() for r in valid_rewards]:
-            raise ValueError(f"Reward model '{reward}' is not compatible with dataset '{script_args.dataset}'.\n"
+            raise ValueError(f"Reward model '{reward}' is not compatible with dataset '{dataset}'.\n"
                            f"Valid reward models for this dataset are: {', '.join(valid_rewards)}")
 else:
     valid_datasets = list(DATASET_REWARD_MAPPING.keys())
-    raise ValueError(f"Dataset '{script_args.dataset}' not supported. Choose from: {', '.join(valid_datasets)}")
+    raise ValueError(f"Dataset '{dataset}' not supported. Choose from: {', '.join(valid_datasets)}")
 
 # Print selected configuration
-print(f"Using dataset: {script_args.dataset}")
+print(f"Using dataset: {dataset}")
 print(f"Using reward models: {script_args.reward_models} with weights: {script_args.reward_weights}")
 
 reward_peft_paths = []
@@ -153,8 +161,8 @@ current_device = Accelerator().local_process_index
 print(current_device)
 
 lora_config = LoraConfig(
-    r=64, 
-    lora_alpha=128, 
+    r=script_args.lora_rank, 
+    lora_alpha=2*script_args.lora_rank, 
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM",
@@ -198,16 +206,34 @@ ppo_trainer = PPOTrainer(
 generation_kwargs = {
     "max_new_tokens": 128 if exp_type == 'assistant' else 48,
     'min_length': -1, 
-    "top_k": 15,
+    "top_k": script_args.top_k,
     "top_p": 1.0, 
     "do_sample": True,
     "temperature": 1.0,
     "begin_suppress_tokens": [tokenizer.eos_token_id],
 }
 
+if process_id == 0:
+    wandb.init(
+        project="ppo",
+        name=script_args.wandb_name,
+    )
+    wandb.config.update(vars(script_args))
+    wandb.config.update({"lora_config": lora_config})
+    wandb.config.update({"generation_kwargs": generation_kwargs})
+
 print("Training........")
 model.gradient_checkpointing_disable()
 model.pretrained_model.config.use_cache = True
+
+import atexit
+def save_and_exit():
+    if ppo_trainer.accelerator.is_main_process:
+        save_path = os.path.join(script_args.save_directory, script_args.wandb_name, 'final')
+        ppo_trainer.save_pretrained(save_path)
+        print("Training interrupted. Model saved to {}".format(save_path))
+    accelerator.end_training()
+atexit.register(save_and_exit)
 
 epochs = script_args.epochs
 mean_scores = []
@@ -261,29 +287,30 @@ for epoch in range(epochs):
         ]
         if hasattr(instructions, 'get_post'):
             all_rewards = []
-            for i, model_name in enumerate(script_args.reward_models):
-                model_reward = reward_model.get_reward_model_scores(queries_responses, instructions.get_post)[i]
+            for k, model_name in enumerate(script_args.reward_models):
+                model_reward = reward_model.get_reward_model_scores(queries_responses, instructions.get_post)[k]
                 all_rewards.append(model_reward)
         else:
             all_rewards = []
-            for i, model_name in enumerate(script_args.reward_models):
-                model_reward = reward_model.get_reward_model_scores(queries_responses)[i]
+            for k, model_name in enumerate(script_args.reward_models):
+                model_reward = reward_model.get_reward_model_scores(queries_responses)[k]
                 all_rewards.append(model_reward)
 
         # Combine rewards using weights
         rewards = []
-        for i in range(len(all_rewards[0])):  # For each sample in batch
+        for k in range(len(all_rewards[0])):  # For each sample in batch
             weighted_reward = 0
             for j, model_rewards in enumerate(all_rewards):  # For each reward model
-                weighted_reward += script_args.reward_weights[j] * model_rewards[i]
+                weighted_reward += script_args.reward_weights[j] * model_rewards[k]
             rewards.append(weighted_reward)
         rewards_tensor = [torch.tensor(r).to(gpu_id) for r in rewards]
-        print("iter {}, batch {}: mean score: {}".format(epoch, i, torch.mean(torch.tensor(rewards)).item()))
+        print("epoch {}, batch {}: mean score: {}".format(epoch, i, torch.mean(torch.tensor(rewards)).item()))
 
         model.gradient_checkpointing_enable()
         model.pretrained_model.config.use_cache = False
         ppo_trainer.config.batch_size = len(query_tensors)
         stats = ppo_trainer.step(query_tensors, response_tensors, rewards_tensor)
+        stats.update({"time/time_elapsed": time() - start})
         ppo_trainer.log_stats(stats, batch, rewards)
         policy_kl = [stats["objective/kl"]]
 
@@ -293,9 +320,9 @@ for epoch in range(epochs):
             mean_scores.append(torch.mean(torch.tensor(rewards)).item())
             std_scores.append(torch.std(torch.tensor(rewards)).item())
             save_path = os.path.join(script_args.save_directory, script_args.wandb_name, 'scores.png')
-            plt.plot(mean_scores)
-            plt.fill_between(np.arange(len(mean_scores)), np.array(mean_scores) - np.array(std_scores), np.array(mean_scores) + np.array(std_scores), alpha=0.5)
-            plt.savefig(save_path)
+            # plt.plot(mean_scores)
+            # plt.fill_between(np.arange(len(mean_scores)), np.array(mean_scores) - np.array(std_scores), np.array(mean_scores) + np.array(std_scores), alpha=0.5)
+            # plt.savefig(save_path)
 
             save_data['kl_mean'].append(np.mean(all_policy_kl))
             save_data['kl_std'].append(np.std(all_policy_kl))
@@ -310,15 +337,13 @@ for epoch in range(epochs):
         accelerator.wait_for_everyone()
         pbar.update(1)
 
-        # save model
-        if ppo_trainer.accelerator.is_main_process and i % 50 == 0 and i != 0:# and i > 100:
+        if ppo_trainer.accelerator.is_main_process and i % 25 == 0 and i != 0:# and i > 100:
             save_path = os.path.join(script_args.save_directory, script_args.wandb_name, 'batch_{}'.format(i))
             ppo_trainer.save_pretrained(save_path)
-            print("iter {}, batch {}: model saved".format(epoch, i))
+            print("epoch {}, batch {}: model saved".format(epoch, i))
+        accelerator.wait_for_everyone()
 
-    # save model
     if ppo_trainer.accelerator.is_main_process:
-        save_path = os.path.join(script_args.save_directory, script_args.dataset, 'batch_{}'.format(i))
+        save_path = os.path.join(script_args.save_directory, "-".join(script_args.reward_models), 'batch_{}'.format(i))
         ppo_trainer.save_pretrained(save_path)
-        print("iter {}, batch {}: model saved".format(epoch, i))
-            
+        print("epoch {}, batch {}: model saved".format(epoch, i))

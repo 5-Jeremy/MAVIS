@@ -1,6 +1,10 @@
 #!/bin/bash
 
-# This script should be run from within the base directory of the MAVIS code containing the Anthropic and/or Summary directories.
+# This script should be run from within the base directory of the MAVIS code containing the Anthropic and/or 
+# Summary directories. The base model type should be set in utils/gen_utils.py within default_defaults_dict
+# before running. All data will be collected sequentially on a single GPU; refer to 
+# get_data_iter_full_utilization.sh, get_data_base_MIG_7b.sh, or summary/reproduce_13B/iter0.sh for how to
+# parallelize data collection across multiple GPUs.
 
 # Script arguments:
 #     $1: The iteration number (0 if you are training a brand new value model for the reference model).
@@ -12,19 +16,21 @@
 
 if [ "$#" -lt 5 ]; then
     echo "Usage: $0 <iteration_number> <num_prompts> <output_dir> <topk> <objective> [beta] [value_model_dir]"
-    echo "Example: $0 1 6000 k=60/ 60 help 4 k=60/value_models/"
+    echo "Example: $0 1 6000 k=60/ 60 help 4 k=60/Models/value_models/"
 fi
 
 if [ "$5" == "help" ] || [ "$5" == "harm" ] || [ "$5" == "humor" ]; then
     DATASET="anthropic"
 elif [ "$5" == "summarization" ] || [ "$5" == "faithful" ]; then
     DATASET="summary"
+elif [ "$5" == "safeRLHF_help" ] || [ "$5" == "safeRLHF_harm" ]; then
+    DATASET="safeRLHF"
 else
     echo "Unknown objective: $5"
     echo "Please specify a valid objective: help, harm, humor, summarization, or faithful."
 fi
 
-# If iteration number is 0, use get_data_random_branching.py
+# If iteration number is 0, use get_data_base.py
 if [ "$1" -eq 0 ]; then
     python get_data_base.py 0 "$2" --output_dir "$3" --topk "$4" --dataset "$DATASET"
     if [ "$#" -lt 5 ]; then
@@ -34,15 +40,15 @@ if [ "$1" -eq 0 ]; then
         LABELING_OBJECTIVE="$5"
     fi
 else
-    VALUE_MODEL_DIR="value_models"
+    VALUE_MODEL_DIR="Models/value_models"
     # The iteration of the value model to use for generation is the previous iteration
     ITER_TO_LOAD="$(( $1 - 1 ))"
-    python get_data_iter.py 0 "$2" "$5" --value_model_dir $VALUE_MODEL_DIR --value_model_iter $ITER_TO_LOAD --output_dir "$3" --topk "$4" --beta "$6" --dynamic_splitting
+    python get_data_iter.py 0 "$2" "$5" --value_model_dir $VALUE_MODEL_DIR --value_model_iter $ITER_TO_LOAD --output_dir "$3" --topk "$4" --beta "$6"
     LABELING_OBJECTIVE="$5"
 fi
 
 if [ "$1" -eq 0 ]; then
-    python label_tree.py "$3/" $LABELING_OBJECTIVE --check_trees --dataset "$DATASET"
+    python label_tree.py "$3/all_data.hdf5" $LABELING_OBJECTIVE --check_trees --dataset "$DATASET"
 else
-    python label_tree_soft.py "$3/" $LABELING_OBJECTIVE --check_trees --dataset "$DATASET"
+    python label_tree.py "$3/all_data.hdf5" $LABELING_OBJECTIVE --compute_KL --check_trees --dataset "$DATASET"
 fi

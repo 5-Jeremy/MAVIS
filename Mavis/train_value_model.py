@@ -2,13 +2,12 @@ import random, torch
 import os, yaml
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-import pickle
+from h5py import File
 import warnings
 import argparse
 from time import time_ns
 warnings.simplefilter("ignore", category=FutureWarning)
 warnings.simplefilter("ignore", category=UserWarning)
-from utils.at_utils import ValNodeTokensHDF5, TreeDataset_HDF5, TreeDataset_Soft
 from transformers import TrainingArguments, Trainer
 def set_seed(seed):
     random.seed(seed)
@@ -21,38 +20,48 @@ from peft import LoraConfig, get_peft_model
 
 set_seed(16)
 
-from utils.loading_utils import load_value_model, load_for_anthropic, load_for_summary
+from utils.loading_utils import load_value_model, load_for_anthropic, load_for_summary, load_for_safeRLHF
+from utils.hdf5_utils import load_all_pickled_objects
+from utils.at_utils import ValNodeTokensHDF5, TreeDataset_HDF5
 
 A = argparse.ArgumentParser()
-A.add_argument("--dataset", type=str, choices=["anthropic", "summary"], default="anthropic")
+A.add_argument("--dataset", type=str, choices=["anthropic", "summary", "safeRLHF"], default="anthropic")
 A.add_argument("--objective", type=str, default="help")
-A.add_argument("--data_dir", type=str, default="Anthropic/data_for_training/tokenized_5000/")
+A.add_argument("--data_file", type=str, default="Training_Output/anthropic/data_for_training/tokenized_5000/all_data_new_format.hdf5")
 A.add_argument("--output_dir", type=str, default="training_output/")
 A.add_argument("--num_epochs", type=int, default=1, help="Number of epochs to train the value model for. Default is 1.")
 A.add_argument("--num_training_steps", type=int, default=None, help="Number of training batches to use (After this many batches, the learning rate will be zero). If not set, it will be automatically calculated based on the dataset size and batch size.")
 A.add_argument("--init_checkpoint", type=str, default=None, help="Path to the checkpoint from which to initialize the value model. If none is set, it will be initialized from TinyLlama 1.1 with a randomly initialized value head.")
-A.add_argument("--batch_size", type=int, default=32) # NOTE: default varies based on objective and is defined below
-A.add_argument("--lr", type=float, default=4e-5, help="Learning rate for training the value model.")
+A.add_argument("--batch_size", type=int, default=32)
+A.add_argument("--lr", type=float, default=2e-5, help="Learning rate for training the value model.")
 A.add_argument("--weight_decay", type=float, default=2e-3, help="Weight decay for the optimizer.")
 A.add_argument("--no_warmup", action="store_true", help="If set, the learning rate will not be warmed up at the beginning of training. This is useful for iterative training where the model has already been trained.")
 A.add_argument("--grad_accumulation_steps", type=int, default=1, help="Number of gradient accumulation steps to use. Default is 1 (no accumulation).")
 A.add_argument("--KL_penalty", type=float, default=None, help="KL divergence penalty multiplier. Using this argument will train a soft value model.")
+A.add_argument("--fraction_bottom_nodes_to_keep", type=float, default=None, help="Fraction of bottom nodes to keep in the training data. If not set, defaults to 0.5 for help and humor objectives and 1.0 for harm objective when doing iterative training (i.e. when --init_checkpoint is set).")
+A.add_argument("--num_trees", type=int, default=None, help="If set, limits the total number of trees used for training data.")
+A.add_argument("--num_val_trees", type=int, default=None, help="Number of trees to use for validation. If not set, defaults to 10% of the dataset.")
+A.add_argument("--disable_tqdm", action="store_true", help="If set, disables the tqdm progress bars during training.")
 args = A.parse_args()
-data_dir = args.data_dir
 output_dir = args.output_dir
 
 if args.dataset == "anthropic":
     assert args.objective in ["help", "harm", "humor"], "Objective must be one of 'help', 'harm', or 'humor' for the Anthropic dataset."
-    loaded_assets = load_for_anthropic(include_gen_model=False, include_inputs=False, include_rewards=False)
+    loaded_assets = load_for_anthropic(include_gen_model=False, include_inputs=False, include_rewards=False, base_model_type="llama")
 elif args.dataset == "summary":
     assert args.objective in ["summarization", "faithful"], "Objective must be one of 'summarization' or 'faithful' for the Summary dataset."
-    loaded_assets = load_for_summary(include_gen_model=False, include_inputs=False, include_rewards=False)
+    loaded_assets = load_for_summary(include_gen_model=False, include_inputs=False, include_rewards=False, base_model_type="llama")
+elif args.dataset == "safeRLHF":
+    assert args.objective in ["safeRLHF_help", "safeRLHF_harm"], "Objective must be one of 'safeRLHF_help' or 'safeRLHF_harm' for the safeRLHF dataset."
+    loaded_assets = load_for_safeRLHF(include_gen_model=False, include_inputs=False, include_rewards=False)
 tokenizer = loaded_assets["gen_tokenizer"]
 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-model = load_value_model(dataset=args.dataset, checkpoint=args.init_checkpoint, torch_dtype=torch.float32)
+model = load_value_model(dataset=args.dataset, checkpoint=args.init_checkpoint, torch_dtype=torch.float32, 
+                         tokenizer=tokenizer, num_objectives=1)
+
 # We only want to add a new PEFT adapter if we are not loading from a checkpoint (i.e. we are training from scratch rather
 # than doing iterative training)
-if args.init_checkpoint is None:
+if args.init_checkpoint is None and not args.no_lora:
     peft_config = LoraConfig(
         r=128,
         lora_alpha=256,
@@ -67,42 +76,42 @@ if args.init_checkpoint is None:
     )
     model = get_peft_model(model, peft_config)
 
+data_file = File(args.data_file, "r")
+
+if args.num_trees is not None and args.num_val_trees is not None:
+    assert args.num_trees > args.num_val_trees, "If both num_trees and num_val_trees are set, num_trees must be larger than num_val_trees."
+
 # Extract the tree containing the training data. Note that the ValNodeTokensHDF5 class must be imported for this to work
 # We need a dictionary mapping prompt names to their respective trees in order to easily access the tokens from the hdf5 file
-train_roots = {}
-for file in os.listdir(os.path.join(data_dir,"train")):
-    if file.endswith(".pkl"):
-        prompt_name = os.path.basename(file).split("_")[0]
-        with open(os.path.join(data_dir,"train",file), "rb") as f:
-            train_roots[prompt_name] = pickle.load(f)
-val_roots = {}
-for file in os.listdir(os.path.join(data_dir,"val")):
-    if file.endswith(".pkl"):
-        prompt_name = os.path.basename(file).split("_")[0]
-        with open(os.path.join(data_dir,"val",file), "rb") as f:
-            val_roots[prompt_name] = pickle.load(f)
+all_roots = load_all_pickled_objects(data_file)
+get_prompt_indx = lambda name: int(name.replace("prompt", ""))
+# We arbitrarily choose to use the prompts with the lowest indices for validation. To determine the range of indices that will
+# go into the validation set, we first sort the list of names and then take the first num_val_trees of them.
+all_prompt_indices = sorted([get_prompt_indx(name) for name in all_roots.keys()])
+if args.num_trees is not None:
+    assert len(all_prompt_indices) >= args.num_trees, "Not enough trees in the dataset to satisfy num_trees."
+    all_prompt_indices = all_prompt_indices[:args.num_trees]
+num_val_trees = args.num_val_trees if args.num_val_trees is not None else int(len(all_prompt_indices) * 0.1)
+val_tree_indices = all_prompt_indices[:num_val_trees]
+max_val_prompt_index = val_tree_indices[-1]
+max_train_prompt_index = all_prompt_indices[-1]
+train_roots = {k: v for k,v in all_roots.items() if get_prompt_indx(k) > max_val_prompt_index and get_prompt_indx(k) <= max_train_prompt_index}
+val_roots = {k: v for k,v in all_roots.items() if get_prompt_indx(k) in range(0, max_val_prompt_index+1)}
 
-tokens_file = os.path.join(data_dir, "all_tokens.hdf5")
-assert os.path.exists(tokens_file), f"Tokens file {tokens_file} does not exist. Please ensure it is present in the data directory."
+tokens_file = data_file  # The tokens are stored in the same hdf5 file as the trees
 
 # For the harmlessness objective, when the data was generated using a MAVIS policy we do not want to remove any bottom nodes
 # since the trees are already very shallow
-fraction_bottom_nodes_to_keep = 1.0 if args.objective in ["harm"] and args.init_checkpoint is not None else 0.5
-exclude_leaves = True 
-if args.KL_penalty is None:
-    dataset_tr = TreeDataset_HDF5(train_roots, tokens_file, fraction_bottom_nodes_to_keep=fraction_bottom_nodes_to_keep, 
-                                objective=args.objective, pad_token_id=tokenizer.pad_token_id)
-    dataset_val = TreeDataset_HDF5(val_roots, tokens_file, exclude_leaves=exclude_leaves, objective=args.objective, 
-                                pad_token_id=tokenizer.pad_token_id, fraction_bottom_nodes_to_keep=fraction_bottom_nodes_to_keep)
+if args.fraction_bottom_nodes_to_keep is not None:
+    fraction_bottom_nodes_to_keep = args.fraction_bottom_nodes_to_keep
 else:
-    # If KL_penalty is specified, we are training a soft value model
-    dataset_tr = TreeDataset_Soft(train_roots, tokens_file, fraction_bottom_nodes_to_keep=fraction_bottom_nodes_to_keep, 
-                                objective=args.objective, pad_token_id=tokenizer.pad_token_id, KL_penalty=args.KL_penalty)
-    dataset_val = TreeDataset_Soft(val_roots, tokens_file, exclude_leaves=exclude_leaves, objective=args.objective, 
-                                pad_token_id=tokenizer.pad_token_id, fraction_bottom_nodes_to_keep=fraction_bottom_nodes_to_keep,
-                                KL_penalty=args.KL_penalty)
+    fraction_bottom_nodes_to_keep = 1.0 if args.objective in ["harm", "safeRLHF_harm"] and args.init_checkpoint is not None else 0.4
 
-metric = load('mse')
+dataset_tr = TreeDataset_HDF5(train_roots, args.data_file, fraction_bottom_nodes_to_keep=fraction_bottom_nodes_to_keep, 
+                            objective=args.objective, pad_token_id=tokenizer.pad_token_id, KL_penalty=args.KL_penalty)
+dataset_val = TreeDataset_HDF5(val_roots, args.data_file, exclude_leaves=True, objective=args.objective, 
+                            pad_token_id=tokenizer.pad_token_id, fraction_bottom_nodes_to_keep=fraction_bottom_nodes_to_keep, 
+                            KL_penalty=args.KL_penalty)
 
 # Need to compute the number of training batches in order to set the learning rate scheduler
 num_train_epochs = args.num_epochs
@@ -112,9 +121,9 @@ num_training_steps = (dataset_tr.__len__()//(batch_size*args.grad_accumulation_s
 train_args = TrainingArguments(
     num_train_epochs=num_train_epochs,
     evaluation_strategy = "steps",
-    eval_steps = 50 if args.dataset == 'anthropic' else 200,
+    eval_steps = 50 if args.dataset in ["anthropic", "safeRLHF"] else 200,
     save_strategy = "steps",
-    save_steps = 50 if args.dataset == 'anthropic' else 200,
+    save_steps = 50 if args.dataset in ["anthropic", "safeRLHF"] else 200,
     save_total_limit=5,
     load_best_model_at_end=True,
     learning_rate=args.lr,
@@ -131,7 +140,8 @@ train_args = TrainingArguments(
     output_dir=output_dir,
     metric_for_best_model='eval_loss',
     ddp_find_unused_parameters=False, # Recommended for performance
-    bf16=True if args.dataset == 'summary' else False, # Use mixed precision training with summary dataset
+    bf16=True, # Use mixed precision training (unlikely to make a big difference)
+    disable_tqdm=args.disable_tqdm,
     )
 
 # Save all arguments to a yaml file
@@ -145,9 +155,10 @@ def log(message):
     training_logfile.flush()
 log(f"Fraction of bottom nodes to keep: {fraction_bottom_nodes_to_keep}")
 
+metric = load('mse')
 def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    return metric.compute(predictions=predictions, references=labels)
+    preds, labels = eval_pred
+    return metric.compute(predictions=preds, references=labels)
 
 from transformers.optimization import get_linear_schedule_with_warmup
 class TrainerWithLinearWarmupSchedule(Trainer):
